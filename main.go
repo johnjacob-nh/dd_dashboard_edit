@@ -7,12 +7,12 @@ import (
 	"regexp"
 )
 
-type jsonRoot map[string]interface{}
+type jsonNode map[string]interface{}
 
 const title = "Tiger 2"
 
 func main() {
-	filename := "/Users/johnjacob/Downloads/Tiger--2022-03-04T19_45_07.json"
+	filename := "/Users/johnjacob/Downloads/Tiger--Latest.json"
 	j := slurpJson(filename)
 	j["id"] = "" //I'm not sure what id does, so make it blank
 	j["title"] = title
@@ -48,8 +48,8 @@ func addAlias(request map[string]interface{}) map[string]interface{} {
 
 func transformWidget(widget interface{}) (interface{}, bool) {
 	//if the requests array has length 1
-	w := jsonRoot(widget.(map[string]interface{}))
-	d := jsonRoot(w["definition"].(map[string]interface{}))
+	w := jsonNode(widget.(map[string]interface{}))
+	d := jsonNode(w["definition"].(map[string]interface{}))
 	typ := d["type"].(string)
 	if typ == "group" {
 		widgets := d["widgets"].([]interface{})
@@ -57,7 +57,7 @@ func transformWidget(widget interface{}) (interface{}, bool) {
 		w["definition"] = d
 		return w, false
 	}
-	requests, skip := isValidRequestsSection(d)
+	requests, skip := needsInvocationSection(d)
 	if skip {
 		return nil, skip
 	}
@@ -67,7 +67,7 @@ func transformWidget(widget interface{}) (interface{}, bool) {
 	}
 	//funcname refers to a filter in datadog which takes the name of lambda
 	functionnames := getFuncNames(requests[0])
-	errorsSection := getErrorsSection(functionnames)
+	errorsSection := createInvocationSection(functionnames)
 	requests = append(requests, errorsSection)
 
 	d["requests"] = requests
@@ -75,12 +75,12 @@ func transformWidget(widget interface{}) (interface{}, bool) {
 	return w, false
 }
 
-func slurpJson(filename string) jsonRoot {
+func slurpJson(filename string) jsonNode {
 	dat, err := os.ReadFile(filename)
 	if err != nil {
 		panic(err)
 	}
-	var j jsonRoot
+	var j jsonNode
 	err = json.Unmarshal(dat, &j)
 	if err != nil {
 		panic(err)
@@ -88,8 +88,8 @@ func slurpJson(filename string) jsonRoot {
 	return j
 }
 
-//isValidRequestsSection tells you if you want to change the widget
-func isValidRequestsSection(definition jsonRoot) ([]jsonRoot, bool) {
+//needsErrorsSection tells you if you if a given section needs an error section added
+func needsErrorsSection(definition jsonNode) ([]jsonNode, bool) {
 	typ, ok := (definition)["type"].(string)
 	if !ok {
 		return nil, true
@@ -98,9 +98,9 @@ func isValidRequestsSection(definition jsonRoot) ([]jsonRoot, bool) {
 		return nil, true
 	}
 	reqs := (definition["requests"]).([]interface{})
-	newReqs := make([]jsonRoot, len(reqs))
+	newReqs := make([]jsonNode, len(reqs))
 	for i, req := range reqs {
-		newReqs[i] = jsonRoot(req.(map[string]interface{}))
+		newReqs[i] = req.(map[string]interface{})
 	}
 	if len(reqs) != 1 {
 		return nil, true
@@ -108,7 +108,27 @@ func isValidRequestsSection(definition jsonRoot) ([]jsonRoot, bool) {
 	return newReqs, false
 }
 
-func getFuncNames(requestSection jsonRoot) []string {
+//needsInvocationSection tells you if a given section needs an invocation section
+func needsInvocationSection(definition jsonNode) ([]jsonNode, bool) {
+	typ, ok := (definition)["type"].(string)
+	if !ok {
+		return nil, true
+	}
+	if typ != "timeseries" {
+		return nil, true
+	}
+	reqs := (definition["requests"]).([]interface{})
+	newReqs := make([]jsonNode, len(reqs))
+	for i, req := range reqs {
+		newReqs[i] = req.(map[string]interface{})
+	}
+	if len(reqs) != 2 {
+		return nil, true
+	}
+	return newReqs, false
+}
+
+func getFuncNames(requestSection jsonNode) []string {
 	r := regexp.MustCompile(`.*functionname:([^,}]*)`)
 	queriesSection, ok := (requestSection["queries"]).([]interface{})
 	funcnames := make([]string, 0)
@@ -127,12 +147,57 @@ func getFuncNames(requestSection jsonRoot) []string {
 	return funcnames
 }
 
-func getErrorsSection(funcnames []string) jsonRoot {
+func concatFuncNames(funcnames []string) string {
 	fnamestr := ""
 	for _, funcname := range funcnames {
 		fnamestr += " functionname:" + funcname
 	}
-	template := []byte(fmt.Sprintf(`
+	return fnamestr
+}
+
+func createSectionFromTemplate(funcnames []string, template string) jsonNode {
+	fnamestr := concatFuncNames(funcnames)
+	j := []byte(fmt.Sprintf(template, fnamestr))
+	var section jsonNode
+	err := json.Unmarshal(j, &section)
+	if err != nil {
+		panic(err)
+	}
+	return section
+}
+
+var invocationsSectionTemplate = `
+          {
+            "on_right_yaxis": true,
+            "formulas": [
+              {
+                "alias": "invocations",
+                "formula": "query0"
+              }
+            ],
+            "queries": [
+              {
+                "data_source": "metrics",
+                "name": "query0",
+                "query": "avg:aws.lambda.invocations{$account,%s}.as_count()"
+              }
+            ],
+            "response_format": "timeseries",
+            "style": {
+              "palette": "dog_classic",
+              "line_type": "solid",
+              "line_width": "normal"
+            },
+            "display_type": "bars"
+          }
+
+`
+
+func createInvocationSection(funcnames []string) jsonNode {
+	return createSectionFromTemplate(funcnames, invocationsSectionTemplate)
+}
+
+var errorsSectionTemplate = `
 	          {
             "on_right_yaxis": true,
             "formulas": [
@@ -165,11 +230,8 @@ func getErrorsSection(funcnames []string) jsonRoot {
             },
             "display_type": "bars"
           }
-`, fnamestr))
-	var errorsSection jsonRoot
-	err := json.Unmarshal(template, &errorsSection)
-	if err != nil {
-		panic(err)
-	}
-	return errorsSection
+`
+
+func createErrorsSection(funcnames []string) jsonNode {
+	return createSectionFromTemplate(funcnames, errorsSectionTemplate)
 }
